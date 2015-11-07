@@ -907,7 +907,12 @@ function mmm()
                 case $DIR in
                   showcommands | snod | dist | incrementaljavac | *=*) ARGS="$ARGS $DIR";;
                   GET-INSTALL-PATH) GET_INSTALL_PATH=$DIR;;
-                  *) echo "No Android.mk in $DIR."; return 1;;
+                  *) if [ -d $DIR ]; then
+                         echo "No Android.mk in $DIR.";
+                     else
+                         echo "Couldn't locate the directory $DIR";
+                     fi
+                     return 1;;
                 esac
             fi
         done
@@ -1605,14 +1610,20 @@ function godir () {
         return
     fi
     T=$(gettop)
-    if [[ ! -f $T/filelist ]]; then
+    if [ ! "$OUT_DIR" = "" ]; then
+        mkdir -p $OUT_DIR
+        FILELIST=$OUT_DIR/filelist
+    else
+        FILELIST=$T/filelist
+    fi
+    if [[ ! -f $FILELIST ]]; then
         echo -n "Creating index..."
-        (\cd $T; find . -wholename ./out -prune -o -wholename ./.repo -prune -o -type f > filelist)
+        (\cd $T; find . -wholename ./out -prune -o -wholename ./.repo -prune -o -type f > $FILELIST)
         echo " Done"
         echo ""
     fi
     local lines
-    lines=($(\grep "$1" $T/filelist | sed -e 's/\/[^/]*$//' | sort | uniq))
+    lines=($(\grep "$1" $FILELIST | sed -e 's/\/[^/]*$//' | sort | uniq))
     if [[ ${#lines[@]} = 0 ]]; then
         echo "Not found"
         return
@@ -1761,14 +1772,20 @@ function installrecovery()
 }
 
 function mka() {
-    case `uname -s` in
-        Darwin)
-            make -j `sysctl hw.ncpu|cut -d" " -f2` "$@"
-            ;;
-        *)
-            mk_timer schedtool -B -n 1 -e ionice -n 1 make -j$(cat /proc/cpuinfo | grep "^processor" | wc -l) "$@"
-            ;;
-    esac
+    local T=$(gettop)
+    if [ "$T" ]; then
+        case `uname -s` in
+            Darwin)
+                make -C $T -j `sysctl hw.ncpu|cut -d" " -f2` "$@"
+                ;;
+            *)
+                mk_timer schedtool -B -n 1 -e ionice -n 1 make -C $T -j$(cat /proc/cpuinfo | grep "^processor" | wc -l) "$@"
+                ;;
+        esac
+
+    else
+        echo "Couldn't locate the top of the tree.  Try setting TOP."
+    fi
 }
 
 function cmka() {
@@ -1864,11 +1881,29 @@ function dopush()
     # Copy: <file>
     LOC="$LOC $(cat $OUT/.log | sed -r 's/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g' | grep '^Copy: ' | cut -d ':' -f 2)"
 
+    # If any files are going to /data, push an octal file permissions reader to device
+    if [ -n "$(echo $LOC | egrep '(^|\s)/data')" ]; then
+        CHKPERM="/data/local/tmp/chkfileperm.sh"
+(
+cat <<'EOF'
+#!/system/xbin/sh
+FILE=$@
+if [ -e $FILE ]; then
+    ls -l $FILE | awk '{k=0;for(i=0;i<=8;i++)k+=((substr($1,i+2,1)~/[rwx]/)*2^(8-i));if(k)printf("%0o ",k);print}' | cut -d ' ' -f1
+fi
+EOF
+) > $OUT/.chkfileperm.sh
+        echo "Pushing file permissions checker to device"
+        adb push $OUT/.chkfileperm.sh $CHKPERM
+        adb shell chmod 755 $CHKPERM
+        rm -f $OUT/.chkfileperm.sh
+    fi
+
     stop_n_start=false
-    for FILE in $LOC; do
-        # Make sure file is in $OUT/system
+    for FILE in $(echo $LOC | tr " " "\n"); do
+        # Make sure file is in $OUT/system or $OUT/data
         case $FILE in
-            $OUT/system/*)
+            $OUT/system/*|$OUT/data/*)
                 # Get target file name (i.e. /system/bin/adb)
                 TARGET=$(echo $FILE | sed "s#$OUT##")
             ;;
@@ -1876,6 +1911,25 @@ function dopush()
         esac
 
         case $TARGET in
+            /data/*)
+                # fs_config only sets permissions and se labels for files pushed to /system
+                if [ -n "$CHKPERM" ]; then
+                    OLDPERM=$(adb shell $CHKPERM $TARGET)
+                    OLDPERM=$(echo $OLDPERM | tr -d '\r' | tr -d '\n')
+                    OLDOWN=$(adb shell ls -al $TARGET | awk '{print $2}')
+                    OLDGRP=$(adb shell ls -al $TARGET | awk '{print $3}')
+                fi
+                echo "Pushing: $TARGET"
+                adb push $FILE $TARGET
+                if [ -n "$OLDPERM" ]; then
+                    echo "Setting file permissions: $OLDPERM, $OLDOWN":"$OLDGRP"
+                    adb shell chown "$OLDOWN":"$OLDGRP" $TARGET
+                    adb shell chmod "$OLDPERM" $TARGET
+                else
+                    echo "$TARGET did not exist previously, you should set file permissions manually"
+                fi
+                adb shell restorecon "$TARGET"
+            ;;
             /system/priv-app/SystemUI/SystemUI.apk|/system/framework/*)
                 # Only need to stop services once
                 if ! $stop_n_start; then
@@ -1891,6 +1945,9 @@ function dopush()
             ;;
         esac
     done
+    if [ -n "$CHKPERM" ]; then
+        adb shell rm $CHKPERM
+    fi
     if $stop_n_start; then
         adb shell start
     fi
@@ -1924,7 +1981,7 @@ function fixup_common_out_dir() {
     fi
 }
 
-# Force JAVA_HOME to point to java 1.7 or java 1.6  if it isn't already set.
+# Force JAVA_HOME to point to java 1.7 if it isn't already set.
 #
 # Note that the MacOS path for java 1.7 includes a minor revision number (sigh).
 # For some reason, installing the JDK doesn't make it show up in the
@@ -1962,9 +2019,9 @@ function pez {
     local retval=$?
     if [ $retval -ne 0 ]
     then
-        echo -e "\e[0;31mFAILURE\e[00m"
+        printf "\e[0;31mFAILURE\e[00m\n"
     else
-        echo -e "\e[0;32mSUCCESS\e[00m"
+        printf "\e[0;32mSUCCESS\e[00m\n"
     fi
     return $retval
 }
@@ -1988,7 +2045,7 @@ function mk_timer()
     if [ -n "$ncolors" ] && [ $ncolors -ge 8 ]; then
         color_failed="\e[0;31m"
         color_success="\e[0;32m"
-        color_reset="\e[00m"
+        color_reset="\e[0m"
     else
         color_failed=""
         color_success=""
@@ -1996,9 +2053,9 @@ function mk_timer()
     fi
     echo
     if [ $ret -eq 0 ] ; then
-        echo -n -e "${color_success}#### make completed successfully "
+        printf "${color_success}#### make completed successfully "
     else
-        echo -n -e "${color_failed}#### make failed to build some targets "
+        printf "${color_failed}#### make failed to build some targets "
     fi
     if [ $hours -gt 0 ] ; then
         printf "(%02g:%02g:%02g (hh:mm:ss))" $hours $mins $secs
@@ -2007,8 +2064,7 @@ function mk_timer()
     elif [ $secs -gt 0 ] ; then
         printf "(%s seconds)" $secs
     fi
-    echo -e " ####${color_reset}"
-    echo
+    printf " ####${color_reset}\n\n"
     return $ret
 }
 
